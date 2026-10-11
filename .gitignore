@@ -23,3 +23,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Generated deployment packages and local snapshots
+.build/
+artifacts/
+frontend/.env.local
+frontend/.env.*.local

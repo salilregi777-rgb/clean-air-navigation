@@ -71,15 +71,12 @@ Urban commuters unknowingly expose themselves to dangerously high levels of air 
 └──────────────────────────────────────────────────────────────────┘
                           │
             ┌─────────────▼─────────────┐
-            │   AWS Cloud (Production)  │
+            │  AWS demo deployment      │
             │  ┌────────┐ ┌───────────┐ │
-            │  │IoT Core│ │ Lambda    │ │
-            │  │Sensors │ │ Functions │ │
+            │  │Amplify │ │ App Runner│ │
+            │  │React UI│ │ FastAPI   │ │
             │  └────────┘ └───────────┘ │
-            │  ┌────────┐ ┌───────────┐ │
-            │  │DynamoDB │ │ API       │ │
-            │  │AQI Data│ │ Gateway   │ │
-            │  └────────┘ └───────────┘ │
+            │     simulated AQI data    │
             └───────────────────────────┘
 ```
 
@@ -213,6 +210,24 @@ Currently covers **10 Bangalore neighborhoods**:
 | **S3 + CloudFront** | Host the React frontend globally |
 | **SageMaker** | ML model to predict AQI based on time, weather, traffic |
 | **SNS** | Push notifications when AQI spikes on user's saved routes |
+
+## ☁️ AWS Deployment (Hackathon Demo)
+
+The demo is split into a static React site on **AWS Amplify Hosting** and the FastAPI service on **AWS App Runner**. The frontend reads `VITE_API_BASE_URL` at build time; the API exposes `/health` for App Runner checks and reads `ALLOWED_ORIGINS` for browser access.
+
+### Deploy the API
+
+1. Push this repository to a Git provider supported by App Runner and create an App Runner service from the repository.
+2. Use the repository root as the source directory and `Dockerfile` as the build file. App Runner listens on port `8080`.
+3. Once the service is running, copy its HTTPS service URL.
+
+### Deploy the frontend
+
+1. Create an Amplify Hosting app connected to the same repository, with `frontend` as the app root. The build configuration is in `frontend/amplify.yml`.
+2. Set the Amplify environment variable `VITE_API_BASE_URL` to the App Runner HTTPS URL, without a trailing slash, then redeploy.
+3. Set the App Runner environment variable `ALLOWED_ORIGINS` to the Amplify site origin (for example `https://main.xxxxx.amplifyapp.com`).
+
+The included route graph and AQI readings are demo data; the live endpoint simulates sensor fluctuations. AWS hosting deploys the demo service, not an IoT sensor network.
 
 ## 👥 Team
 

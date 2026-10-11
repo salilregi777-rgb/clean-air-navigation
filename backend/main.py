@@ -5,14 +5,12 @@ Features real-time AQI simulation and health impact analysis.
 """
 
 import heapq
-import math
 import random
-import time
-from datetime import datetime, timezone, timedelta
+import os
+from datetime import datetime, timezone
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
 app = FastAPI(
     title="Clean Air Navigation API",
@@ -25,11 +23,17 @@ app = FastAPI(
 # ---------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=[origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",")],
+    allow_credentials=False,
+    allow_methods=["GET"],
     allow_headers=["*"],
 )
+
+
+@app.get("/health")
+def health_check():
+    """Lightweight health endpoint for AWS service checks."""
+    return {"status": "ok", "service": "clean-air-navigation-api"}
 
 # ---------------------------------------------------------------------------
 # Graph: 10 Nodes (Bangalore neighbourhoods with realistic coords)
@@ -128,268 +132,134 @@ for a, b, dist, aqi, pm25, pm10 in EDGES:
     ADJ[b].append((a, dist, aqi, pm25, pm10))
 
 
-# ---------------------------------------------------------------------------
-# Health Impact Calculator
-# ---------------------------------------------------------------------------
-def calculate_health_impact(
-    distance_km: float,
-    avg_aqi: int,
-    avg_pm25: float,
-    estimated_time_min: int,
-) -> dict:
-    """
-    Calculate health impact metrics for a given route.
-    Based on WHO air quality guidelines and epidemiological studies.
-    """
-    # Breathing rate: ~15 L/min at rest, ~40 L/min light exercise (cycling/walking)
-    # Average commuter: ~20 L/min
-    breathing_rate_l_per_min = 20.0
-    total_air_inhaled_liters = breathing_rate_l_per_min * estimated_time_min
-    total_air_inhaled_m3 = total_air_inhaled_liters / 1000
-
-    # PM2.5 dose (µg inhaled)
-    pm25_dose_ug = avg_pm25 * total_air_inhaled_m3
-
-    # WHO guideline: 15 µg/m³ annual, 45 µg/m³ 24-hour (2021 guidelines)
-    who_24h_guideline = 45.0
-    pm25_vs_who = round((avg_pm25 / who_24h_guideline) * 100, 1)
-
-    # Equivalent cigarettes: ~22 µg/m³ PM2.5 for 24h ≈ 1 cigarette
-    # For commute duration proportionally
-    cigarette_equivalent = round((avg_pm25 * estimated_time_min) / (22 * 24 * 60), 3)
-
-    # Respiratory risk score (0-100)
-    if avg_aqi <= 50:
-        risk_level = "Low"
-        risk_score = int(avg_aqi * 0.4)
-        risk_color = "#0f9d58"
-    elif avg_aqi <= 100:
-        risk_level = "Moderate"
-        risk_score = int(20 + (avg_aqi - 50) * 0.6)
-        risk_color = "#f9ab00"
-    elif avg_aqi <= 150:
-        risk_level = "High"
-        risk_score = int(50 + (avg_aqi - 100) * 0.6)
-        risk_color = "#e8710a"
-    elif avg_aqi <= 200:
-        risk_level = "Very High"
-        risk_score = int(80 + (avg_aqi - 150) * 0.4)
-        risk_color = "#d93025"
-    else:
-        risk_level = "Hazardous"
-        risk_score = min(100, int(90 + (avg_aqi - 200) * 0.2))
-        risk_color = "#a50e0e"
-
-    # Estimated health cost (INR) based on WHO DALY model simplified
-    # Rough: 1 µg PM2.5 exposure per m³ ≈ ₹0.50 health cost per trip
-    health_cost_inr = round(avg_pm25 * total_air_inhaled_m3 * 0.5, 2)
-
-    return {
-        "pm25_dose_ug": round(pm25_dose_ug, 2),
-        "total_air_inhaled_liters": round(total_air_inhaled_liters, 1),
-        "pm25_vs_who_percent": pm25_vs_who,
-        "cigarette_equivalent": cigarette_equivalent,
-        "risk_level": risk_level,
-        "risk_score": min(risk_score, 100),
-        "risk_color": risk_color,
-        "health_cost_inr": health_cost_inr,
-        "who_guideline_exceeded": avg_pm25 > who_24h_guideline,
-    }
+# Exposure estimates use a fixed speed and breathing rate for the demonstration.
+SPEED_KMH = 30.0
+BREATHING_M3_MIN = 0.020
 
 
-# ---------------------------------------------------------------------------
-# Dijkstra (generic weight)
-# ---------------------------------------------------------------------------
-def dijkstra(
-    start: str,
-    end: str,
-    weight: str = "distance",
-) -> dict | None:
-    """
-    Run Dijkstra from *start* to *end*.
-    `weight` is 'distance', 'aqi', or 'balanced'.
-    Returns {path, total_distance_km, avg_aqi, avg_pm25, estimated_time_min, coordinates, health_impact}.
-    """
+def validate_trip(start: str, end: str):
     if start not in NODES or end not in NODES:
+        raise HTTPException(status_code=404, detail="Choose a neighborhood from the available locations.")
+    if start == end:
+        raise HTTPException(status_code=400, detail="Choose two different neighborhoods.")
+
+
+def dijkstra(start: str, end: str, weight: str = "distance") -> dict | None:
+    """Minimize distance, PM2.5 × distance, or a normalized combination.
+
+    With fixed speed and breathing rate, minimizing PM2.5 × distance also
+    minimizes estimated inhaled dose. All averages are distance weighted.
+    Lines on the map connect sample graph nodes; they are not road geometry.
+    """
+    if start not in NODES or end not in NODES or start == end:
         return None
-
-    dist_map: dict[str, float] = {n: float("inf") for n in NODES}
-    dist_map[start] = 0
-    prev: dict[str, str | None] = {n: None for n in NODES}
-    path_distance: dict[str, float] = {n: 0.0 for n in NODES}
-    path_aqi_sum: dict[str, float] = {n: 0.0 for n in NODES}
-    path_pm25_sum: dict[str, float] = {n: 0.0 for n in NODES}
-    path_pm10_sum: dict[str, float] = {n: 0.0 for n in NODES}
-    edge_count: dict[str, int] = {n: 0 for n in NODES}
-
-    pq: list[tuple[float, str]] = [(0, start)]
-
-    while pq:
-        cost, u = heapq.heappop(pq)
-        if cost > dist_map[u]:
+    costs = {name: float("inf") for name in NODES}
+    costs[start] = 0
+    previous = {}
+    queue = [(0, start)]
+    while queue:
+        cost, node = heapq.heappop(queue)
+        if cost > costs[node]:
             continue
-        if u == end:
+        if node == end:
             break
-        for v, d, a, p25, p10 in ADJ[u]:
-            if weight == "distance":
-                w = d
-            elif weight == "aqi":
-                w = a
-            else:  # balanced
-                w = d * 0.4 + a * 0.6  # favor cleaner air, but consider distance
-            new_cost = dist_map[u] + w
-            if new_cost < dist_map[v]:
-                dist_map[v] = new_cost
-                prev[v] = u
-                path_distance[v] = path_distance[u] + d
-                path_aqi_sum[v] = path_aqi_sum[u] + a
-                path_pm25_sum[v] = path_pm25_sum[u] + p25
-                path_pm10_sum[v] = path_pm10_sum[u] + p10
-                edge_count[v] = edge_count[u] + 1
-                heapq.heappush(pq, (new_cost, v))
-
-    if dist_map[end] == float("inf"):
+        for neighbor, distance, aqi, pm25, pm10 in ADJ[node]:
+            edge_cost = distance
+            if weight == "aqi":
+                edge_cost = distance * pm25
+            elif weight == "balanced":
+                edge_cost = distance * (0.5 + 0.5 * pm25 / 35.0)
+            new_cost = cost + edge_cost
+            if new_cost < costs[neighbor]:
+                costs[neighbor] = new_cost
+                previous[neighbor] = (node, distance, aqi, pm25, pm10)
+                heapq.heappush(queue, (new_cost, neighbor))
+    if end not in previous:
         return None
-
-    path: list[str] = []
-    node: str | None = end
-    while node is not None:
-        path.append(node)
-        node = prev[node]
+    path = [end]
+    distance = aqi_sum = pm25_sum = pm10_sum = 0.0
+    current = end
+    while current != start:
+        parent, length, aqi, pm25, pm10 = previous[current]
+        distance += length
+        aqi_sum += aqi * length
+        pm25_sum += pm25 * length
+        pm10_sum += pm10 * length
+        path.append(parent)
+        current = parent
     path.reverse()
-
-    total_dist = round(path_distance[end], 1)
-    edges = edge_count[end] or 1
-    avg_aqi = round(path_aqi_sum[end] / edges)
-    avg_pm25 = round(path_pm25_sum[end] / edges, 1)
-    avg_pm10 = round(path_pm10_sum[end] / edges, 1)
-    est_time = round(total_dist / 30 * 60)
-
-    coordinates = [[NODES[n]["lat"], NODES[n]["lng"]] for n in path]
-
-    health = calculate_health_impact(total_dist, avg_aqi, avg_pm25, est_time)
-
+    duration = distance / SPEED_KMH * 60
+    # Do not round the time or concentrations before calculating exposure.
+    dose = pm25_sum / SPEED_KMH * 60 * BREATHING_M3_MIN
     return {
         "path": path,
-        "coordinates": coordinates,
-        "total_distance_km": total_dist,
-        "avg_aqi": avg_aqi,
-        "avg_pm25": avg_pm25,
-        "avg_pm10": avg_pm10,
-        "estimated_time_min": est_time,
-        "health_impact": health,
+        "coordinates": [[NODES[name]["lat"], NODES[name]["lng"]] for name in path],
+        "total_distance_km": round(distance, 1),
+        "avg_aqi": round(aqi_sum / distance),
+        "avg_pm25": round(pm25_sum / distance, 1),
+        "avg_pm10": round(pm10_sum / distance, 1),
+        "estimated_time_min": max(1, round(duration)),
+        "health_impact": {
+            "pm25_dose_ug": round(dose, 2),
+            "total_air_inhaled_liters": round(duration * BREATHING_M3_MIN * 1000, 1),
+        },
     }
 
 
-# ---------------------------------------------------------------------------
-# API Endpoints
-# ---------------------------------------------------------------------------
 @app.get("/api/v1/route")
-def get_route(
-    start: str = Query("Koramangala", description="Start node"),
-    end: str = Query("Whitefield", description="End node"),
-):
-    """Return the fastest, cleanest, and balanced routes between two nodes."""
-    fastest = dijkstra(start, end, weight="distance")
-    clean = dijkstra(start, end, weight="aqi")
-    balanced = dijkstra(start, end, weight="balanced")
-
-    if fastest is None or clean is None:
-        return {"error": f"No route found between '{start}' and '{end}'."}
-
-    # Calculate health savings
-    health_savings = None
-    if fastest and clean:
-        pm25_saved = round(
-            fastest["health_impact"]["pm25_dose_ug"] - clean["health_impact"]["pm25_dose_ug"], 2
-        )
-        cost_saved = round(
-            fastest["health_impact"]["health_cost_inr"] - clean["health_impact"]["health_cost_inr"], 2
-        )
-        cig_saved = round(
-            fastest["health_impact"]["cigarette_equivalent"] - clean["health_impact"]["cigarette_equivalent"], 4
-        )
-        health_savings = {
-            "pm25_dose_saved_ug": max(0, pm25_saved),
-            "health_cost_saved_inr": max(0, cost_saved),
-            "cigarette_equivalent_saved": max(0, cig_saved),
-            "aqi_reduction_percent": round(
-                ((fastest["avg_aqi"] - clean["avg_aqi"]) / fastest["avg_aqi"]) * 100
-            ) if fastest["avg_aqi"] > 0 else 0,
-        }
-
+def get_route(start: str = Query("Koramangala"), end: str = Query("Whitefield")):
+    validate_trip(start, end)
+    fastest = dijkstra(start, end)
+    clean = dijkstra(start, end, "aqi")
+    balanced = dijkstra(start, end, "balanced")
+    if not fastest or not clean or not balanced:
+        raise HTTPException(status_code=404, detail="No route connects these neighborhoods.")
+    fastest_dose = fastest["health_impact"]["pm25_dose_ug"]
+    clean_dose = clean["health_impact"]["pm25_dose_ug"]
     return {
         "fastest_route": fastest,
         "clean_route": clean,
         "balanced_route": balanced,
-        "health_savings": health_savings,
+        "health_savings": {
+            "pm25_dose_saved_ug": round(max(0, fastest_dose - clean_dose), 2),
+            "exposure_reduction_percent": round(100 * (1 - clean_dose / fastest_dose)) if fastest_dose else 0,
+        },
         "nodes": NODES,
+        "data_source": "simulated",
+        "assumptions": {"speed_kmh": SPEED_KMH, "breathing_l_min": BREATHING_M3_MIN * 1000},
     }
 
 
 @app.get("/api/v1/nodes")
 def get_nodes():
-    """Return all available graph nodes."""
-    return {"nodes": NODES, "node_names": list(NODES.keys())}
+    return {"nodes": NODES, "node_names": list(NODES)}
 
 
 @app.get("/api/v1/aqi/live")
 def get_live_aqi():
-    """
-    Simulate real-time AQI readings with small random fluctuations.
-    In production, this would pull from AWS IoT sensors via Lambda.
-    """
-    ist = timezone(timedelta(hours=5, minutes=30))
-    now = datetime.now(ist)
-    live_data = {}
-    for name, info in NODES.items():
-        # Add realistic fluctuation (±10% of base AQI)
-        base = info["aqi"]
-        fluctuation = random.uniform(-0.10, 0.10)
-        live_aqi = max(5, round(base * (1 + fluctuation)))
-        live_pm25 = max(1, round(info["pm25"] * (1 + fluctuation), 1))
-
-        live_data[name] = {
-            "aqi": live_aqi,
-            "pm25": live_pm25,
+    """Independent simulated readings, not a live input to the routing graph."""
+    now = datetime.now(timezone.utc)
+    # Every caller sees the same demo snapshot within a 30-second interval.
+    rng = random.Random(int(now.timestamp()) // 30)
+    readings = {}
+    for name, node in NODES.items():
+        fluctuation = rng.uniform(-0.10, 0.10)
+        readings[name] = {
+            "aqi": max(5, round(node["aqi"] * (1 + fluctuation))),
+            "pm25": round(node["pm25"] * (1 + fluctuation), 1),
             "timestamp": now.isoformat(),
-            "trend": random.choice(["rising", "falling", "stable"]),
         }
-    return {"live_aqi": live_data, "updated_at": now.isoformat()}
+    return {"live_aqi": readings, "updated_at": now.isoformat(), "data_source": "simulated"}
 
 
 @app.get("/api/v1/health/annual-savings")
-def get_annual_savings(
-    start: str = Query("Koramangala"),
-    end: str = Query("Whitefield"),
-    trips_per_week: int = Query(5, ge=1, le=14),
-):
-    """
-    Calculate annual health savings if user consistently chooses the clean route.
-    """
-    fastest = dijkstra(start, end, weight="distance")
-    clean = dijkstra(start, end, weight="aqi")
-
-    if not fastest or not clean:
-        return {"error": "No route found"}
-
-    trips_per_year = trips_per_week * 52
-
-    # Per-trip savings
-    pm25_per_trip = fastest["health_impact"]["pm25_dose_ug"] - clean["health_impact"]["pm25_dose_ug"]
-    cost_per_trip = fastest["health_impact"]["health_cost_inr"] - clean["health_impact"]["health_cost_inr"]
-    cig_per_trip = fastest["health_impact"]["cigarette_equivalent"] - clean["health_impact"]["cigarette_equivalent"]
-
-    # Extra distance and time
-    extra_km = clean["total_distance_km"] - fastest["total_distance_km"]
-    extra_min = clean["estimated_time_min"] - fastest["estimated_time_min"]
-
+def get_annual_savings(start: str = Query("Koramangala"), end: str = Query("Whitefield"), trips_per_week: int = Query(10, ge=1, le=14)):
+    routes = get_route(start, end)
+    count = trips_per_week * 52
     return {
-        "trips_per_year": trips_per_year,
-        "annual_pm25_saved_ug": round(max(0, pm25_per_trip * trips_per_year), 1),
-        "annual_health_cost_saved_inr": round(max(0, cost_per_trip * trips_per_year), 0),
-        "annual_cigarettes_avoided": round(max(0, cig_per_trip * trips_per_year), 2),
-        "annual_extra_km": round(extra_km * trips_per_year, 1),
-        "annual_extra_hours": round((extra_min * trips_per_year) / 60, 1),
-        "verdict": "The clean route adds minimal travel time but significantly reduces your annual pollution exposure.",
+        "trips_per_year": count,
+        "annual_pm25_saved_ug": round(routes["health_savings"]["pm25_dose_saved_ug"] * count, 1),
+        "annual_extra_hours": round((routes["clean_route"]["estimated_time_min"] - routes["fastest_route"]["estimated_time_min"]) * count / 60, 1),
+        "data_source": "simulated",
+        "assumptions": routes["assumptions"],
     }
